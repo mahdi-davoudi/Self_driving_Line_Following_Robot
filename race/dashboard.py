@@ -39,6 +39,9 @@ import math
 import queue
 import threading
 import time
+import os
+import subprocess
+from pathlib import Path
 from collections import deque
 
 import cv2
@@ -54,7 +57,7 @@ TELEMETRY_HZ = 10        # how often telemetry is pushed to each browser
 # ---------------------------------------------------------------------------
 # Standalone camera (only used by `python dashboard.py`)
 # ---------------------------------------------------------------------------
-USE_DROIDCAM = True                              # True: phone over Wi-Fi, False: Picamera2 / webcam
+USE_DROIDCAM = False                              # True: phone over Wi-Fi, False: Picamera2 / webcam
 DROIDCAM_URL = "http://10.98.50.94:4747/video"   # phone IP changes -> update it
 F_Width = 384                                    # must match the race code
 F_Height = 216
@@ -96,30 +99,69 @@ PARAM_SPEC = {
 
 
 class SharedState:
-    """Data shared between the control loop (writer) and the web server (reader)."""
+    """Thread-safe latest-value store shared by the race loop and web workers."""
 
     def __init__(self):
-        self.frames = {}       # name -> latest numpy image (BGR or gray). Publish a NEW array each frame.
-        self.telemetry = {}    # latest values to display
-        self.config = {}       # live reference to the vision config dict
-        self.raw_frame = None  # latest raw camera frame (input of the Calibration tab)
-        self.raw_id = 0        # incremented for every published raw frame
+        self.frames = {}
+        self.telemetry = {}
+        self.config = {}
+        self.raw_frame = None
+        self.raw_id = 0
         self.standalone = False
-        self._commands = queue.Queue()
+        self.lock = threading.RLock()
+        self._commands = deque()
+        self._command_lock = threading.Lock()
+        self._jpeg_cache = {}
+        self._jpeg_lock = threading.Lock()
+        self.last_publish = 0.0
 
     def publish_raw(self, frame) -> None:
-        """Call once per loop iteration with the raw camera frame. Publish a NEW array each time."""
-        self.raw_frame = frame
-        self.raw_id += 1
+        with self.lock:
+            self.raw_frame = frame
+            self.raw_id += 1
+            self.last_publish = time.monotonic()
+
+    def publish_frame(self, name, frame) -> None:
+        with self.lock:
+            self.frames[name] = frame
+
+    def snapshot_frames(self):
+        with self.lock:
+            return dict(self.frames)
+
+    def snapshot_telemetry(self):
+        with self.lock:
+            return dict(self.telemetry)
+
+    def publish_telemetry(self, values):
+        with self.lock:
+            self.telemetry = dict(values)
 
     def push_command(self, name: str) -> None:
-        self._commands.put(name)
+        with self._command_lock:
+            if name == "stop":
+                self._commands.clear()
+                self._commands.appendleft("stop")
+            elif name == "start":
+                self._commands.clear()
+                self._commands.append("start")
 
     def pop_command(self):
-        try:
-            return self._commands.get_nowait()
-        except queue.Empty:
+        with self._command_lock:
+            return self._commands.popleft() if self._commands else None
+
+    def encode_jpeg(self, name, frame):
+        with self._jpeg_lock:
+            cached = self._jpeg_cache.get(name)
+            if cached is not None and cached[0] is frame:
+                return cached[1]
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        if not ok:
             return None
+        encoded = buf.tobytes()
+        with self._jpeg_lock:
+            self._jpeg_cache[name] = (frame, encoded)
+        return encoded
 
 
 state = SharedState()
@@ -437,16 +479,24 @@ class CalibWorker:
 
     def set_params(self, update):
         with self.lock:
+            candidate = dict(self.params)
             for k, v in update.items():
                 if k not in PARAM_SPEC:
                     continue
                 default, lo, hi, _step, _group = PARAM_SPEC[k]
                 try:
-                    v = type(default)(v)
-                except (TypeError, ValueError):
+                    value = type(default)(v)
+                    if not math.isfinite(float(value)):
+                        continue
+                    candidate[k] = max(lo, min(hi, value))
+                except (TypeError, ValueError, OverflowError):
                     continue
-                self.params[k] = max(lo, min(hi, v))
-            self.version += 1
+            pairs = (("CANNY_LOW", "CANNY_HIGH"), ("ROI_TOP_RL", "ROI_BOTTOM_RL"),
+                     ("ROI_LEFT_RL", "ROI_RIGHT_RL"), ("ROI_TOP_LL", "ROI_BOTTOM_LL"),
+                     ("ROI_LEFT_LL", "ROI_RIGHT_LL"))
+            if all(candidate[a] < candidate[b] for a, b in pairs):
+                self.params = candidate
+                self.version += 1
 
     def load_from_robot(self, config):
         loaded = []
@@ -484,7 +534,8 @@ class CalibWorker:
     # ---- freeze / reset ---------------------------------------------------
     def set_frozen(self, on):
         if on:
-            f = self.shared.raw_frame
+            with self.shared.lock:
+                f = self.shared.raw_frame
             if f is not None:
                 self.frozen_frame = f.copy()
         else:
@@ -495,7 +546,10 @@ class CalibWorker:
             self.stats.reset()
 
     def current_raw(self):
-        return self.frozen_frame if self.frozen_frame is not None else self.shared.raw_frame
+        if self.frozen_frame is not None:
+            return self.frozen_frame
+        with self.shared.lock:
+            return self.shared.raw_frame
 
     # ---- status for the browser ------------------------------------------
     def status(self):
@@ -504,7 +558,7 @@ class CalibWorker:
             st = self.stats
             n = max(st.frames, 1)
             return {
-                "has_frame": self.shared.raw_frame is not None,
+                "has_frame": self.current_raw() is not None,
                 "frozen": self.frozen_frame is not None,
                 "live": dict(self.live),
                 "stats": {
@@ -569,7 +623,8 @@ class CalibWorker:
                 continue
 
             last_key = None
-            frame, src_id = self.shared.raw_frame, self.shared.raw_id
+            with self.shared.lock:
+                frame, src_id = self.shared.raw_frame, self.shared.raw_id
             if frame is None or src_id == last_src_id:
                 time.sleep(0.005)
                 continue
@@ -624,24 +679,49 @@ calib = CalibWorker(state)
 #   /calib/stream/<name>  frames produced by the calibration tab
 # ===========================================================================
 async def _mjpeg(request: Request, get_frames, name: str):
-    last = None
+    last_frame = None
     delay = 1.0 / STREAM_FPS_LIMIT
     while not await request.is_disconnected():
-        frame = get_frames().get(name)
-        if frame is None or frame is last:       # nothing new yet
+        frames = get_frames()
+        frame = frames.get(name)
+        if frame is None or frame is last_frame:
             await asyncio.sleep(0.02)
             continue
-        last = frame
-        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        if ok:
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+        last_frame = frame
+        if get_frames == state.snapshot_frames:
+            encoded = await asyncio.to_thread(state.encode_jpeg, name, frame)
+        else:
+            encoded = await asyncio.to_thread(_encode_calib_frame, name, frame)
+        if encoded is not None:
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + encoded + b"\r\n"
         await asyncio.sleep(delay)
+
+
+def _encode_calib_frame(name, frame):
+    return _cached_calib_jpeg(name, frame)
+
+
+_calib_jpeg_lock = threading.Lock()
+_calib_jpeg_cache = {}
+
+def _cached_calib_jpeg(name, frame):
+    with _calib_jpeg_lock:
+        cached = _calib_jpeg_cache.get(name)
+        if cached is not None and cached[0] is frame:
+            return cached[1]
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    if not ok:
+        return None
+    data = buf.tobytes()
+    with _calib_jpeg_lock:
+        _calib_jpeg_cache[name] = (frame, data)
+    return data
 
 
 @app.get("/stream/{name}")
 async def stream(request: Request, name: str):
     return StreamingResponse(
-        _mjpeg(request, lambda: state.frames, name),
+        _mjpeg(request, state.snapshot_frames, name),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
@@ -649,14 +729,15 @@ async def stream(request: Request, name: str):
 @app.get("/calib/stream/{name}")
 async def calib_stream(request: Request, name: str):
     return StreamingResponse(
-        _mjpeg(request, lambda: calib.frames, name),
+        _mjpeg(request, lambda: dict(calib.frames), name),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
 @app.get("/api/streams")
 async def list_streams():
-    return list(state.frames.keys())
+    with state.lock:
+        return list(state.frames.keys())
 
 
 @app.get("/api/info")
@@ -672,7 +753,7 @@ async def ws_telemetry(ws: WebSocket):
     await ws.accept()
     try:
         while True:
-            await ws.send_text(json.dumps(state.telemetry, default=_to_jsonable))
+            await ws.send_text(json.dumps(state.snapshot_telemetry(), default=_to_jsonable))
             await asyncio.sleep(1.0 / TELEMETRY_HZ)
     except Exception:
         pass  # client closed the page - nothing to clean up
@@ -681,20 +762,148 @@ async def ws_telemetry(ws: WebSocket):
 # ----------------------------------------------------------------------------
 # Live tuning + commands (robot config)
 # ----------------------------------------------------------------------------
+def _read_system_uptime():
+    try:
+        return round(float(Path("/proc/uptime").read_text().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _read_cpu_temperature():
+    try:
+        raw = Path("/sys/class/thermal/thermal_zone0/temp").read_text().strip()
+        return round(int(raw) / 1000.0, 1)
+    except (OSError, ValueError):
+        return None
+
+
+def _read_memory():
+    values = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            key, raw = line.split(":", 1)
+            if key in ("MemTotal", "MemAvailable"):
+                values[key] = int(raw.strip().split()[0])
+        total = values.get("MemTotal")
+        available = values.get("MemAvailable")
+        if total:
+            used = total - available if available is not None else None
+            return {"total_mb": round(total / 1024),
+                    "used_mb": round(used / 1024) if used is not None else None,
+                    "percent": round(100 * used / total, 1) if used is not None else None}
+    except (OSError, ValueError):
+        pass
+    return {"total_mb": None, "used_mb": None, "percent": None}
+
+
+def _read_cpu_usage():
+    try:
+        fields = Path("/proc/stat").read_text().splitlines()[0].split()[1:]
+        values = [int(v) for v in fields]
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        total = sum(values)
+        global _cpu_prev
+        previous = _cpu_prev
+        _cpu_prev = (idle, total)
+        if previous is None:
+            return None
+        di, dt = idle - previous[0], total - previous[1]
+        return round(100 * (1 - di / dt), 1) if dt > 0 else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+_cpu_prev = None
+
+
+def _read_throttled():
+    try:
+        result = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True,
+                                text=True, timeout=0.4, check=False)
+        if result.returncode == 0:
+            return result.stdout.strip().split("=", 1)[-1]
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+@app.get("/api/system")
+async def system_status():
+    with state.lock:
+        last = state.last_publish
+    age = round(time.monotonic() - last, 2) if last else None
+    return {
+        "cpu_percent": _read_cpu_usage(),
+        "memory": _read_memory(),
+        "temperature_c": _read_cpu_temperature(),
+        "throttled": _read_throttled(),
+        "camera_frame_age_s": age,
+        "camera_alive": age is not None and age < 2.0,
+        "uptime_s": _read_system_uptime(),
+    }
+
+
 @app.get("/api/config")
 async def get_config():
-    return state.config
+    with state.lock:
+        return dict(state.config)
 
 
 @app.post("/api/config")
 async def set_config(update: dict):
-    for key, value in update.items():
-        if key in state.config:
+    if not isinstance(update, dict) or not update:
+        return {"ok": False, "error": "Expected a non-empty JSON object"}
+    with state.lock:
+        current = dict(state.config)
+        candidate = dict(current)
+        errors = {}
+        for key, value in update.items():
+            if key not in current:
+                errors[key] = "Unknown configuration key"
+                continue
             try:
-                state.config[key] = type(state.config[key])(value)   # keep original type (int/float)
-            except (TypeError, ValueError):
-                pass
-    return state.config
+                original = current[key]
+                if isinstance(original, bool):
+                    if value not in (True, False, 0, 1, "0", "1"):
+                        raise ValueError
+                    candidate[key] = bool(int(value)) if isinstance(value, (int, str)) else value
+                elif isinstance(original, int):
+                    number = float(value)
+                    if not math.isfinite(number) or not number.is_integer():
+                        raise ValueError
+                    candidate[key] = int(number)
+                elif isinstance(original, float):
+                    number = float(value)
+                    if not math.isfinite(number):
+                        raise ValueError
+                    candidate[key] = number
+                else:
+                    candidate[key] = value
+                if key in PARAM_SPEC:
+                    spec = PARAM_SPEC[key]
+                    if not spec[1] <= candidate[key] <= spec[2]:
+                        raise ValueError
+            except (TypeError, ValueError, OverflowError):
+                errors[key] = "Invalid value or outside the allowed range"
+
+        checks = [
+            ("CANNY_LOW", "CANNY_HIGH", "CANNY_LOW must be lower than CANNY_HIGH"),
+            ("ROI_TOP_RL", "ROI_BOTTOM_RL", "Right ROI top must be below bottom"),
+            ("ROI_LEFT_RL", "ROI_RIGHT_RL", "Right ROI left must be below right"),
+            ("ROI_TOP_LL", "ROI_BOTTOM_LL", "Left ROI top must be below bottom"),
+            ("ROI_LEFT_LL", "ROI_RIGHT_LL", "Left ROI left must be below right"),
+        ]
+        for low, high, message in checks:
+            if low in candidate and high in candidate and candidate[low] >= candidate[high]:
+                errors[low] = message
+                errors[high] = message
+        for key, value in candidate.items():
+            if key.startswith("ROI_") and not 0.0 <= float(value) <= 1.0:
+                errors[key] = "ROI values must be between 0 and 1"
+        if errors:
+            return {"ok": False, "errors": errors, "config": current}
+        state.config.update(candidate)
+        return {"ok": True, "config": dict(state.config)}
 
 
 @app.post("/api/cmd/{name}")
@@ -774,12 +983,24 @@ async def index():
     return HTML_PAGE
 
 
+_server_lock = threading.Lock()
+_server_instance = None
+_server_thread = None
+
+
 def start(host: str = "0.0.0.0", port: int = 8000):
-    """Start the web server (and the calibration thread) in daemon threads and return immediately."""
-    calib.start()
-    server = uvicorn.Server(uvicorn.Config(app, host=host, port=port, log_level="warning"))
-    threading.Thread(target=server.run, daemon=True).start()
-    return server
+    """Start the dashboard once in a background thread."""
+    global _server_instance, _server_thread
+    with _server_lock:
+        if _server_thread is not None and _server_thread.is_alive():
+            return _server_instance
+        calib.start()
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, name="robot-dashboard", daemon=True)
+        thread.start()
+        _server_instance, _server_thread = server, thread
+        return server
 
 
 # ===========================================================================
@@ -934,6 +1155,7 @@ HTML_PAGE = r"""<!doctype html>
 
     <div class="side">
       <div class="card"><h3>Telemetry</h3><table id="telemetry"></table></div>
+      <div class="card"><h3>System health</h3><table id="system-health"></table></div>
       <div class="card"><h3>Config (live)</h3><div id="config"></div></div>
     </div>
   </div>
@@ -1055,6 +1277,28 @@ function connectWS() {
 }
 connectWS();
 
+async function refreshSystemHealth() {
+  try {
+    const r = await fetch('/api/system', {cache: 'no-store'});
+    const s = await r.json();
+    const m = s.memory || {};
+    const rows = [
+      ['CPU', val(s.cpu_percent) + (s.cpu_percent == null ? '' : '%')],
+      ['RAM', `${val(m.used_mb)} / ${val(m.total_mb)} MB (${val(m.percent)}%)`],
+      ['CPU temperature', val(s.temperature_c) + (s.temperature_c == null ? '' : ' °C')],
+      ['Camera', s.camera_alive ? 'ONLINE' : 'NO RECENT FRAME'],
+      ['Last frame age', val(s.camera_frame_age_s) + ' s'],
+      ['Throttling flags', val(s.throttled)],
+      ['Process uptime', val(s.uptime_s) + ' s']
+    ];
+    $('system-health').innerHTML = rows.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join('');
+  } catch (e) {
+    $('system-health').innerHTML = '<tr><td colspan="2">System metrics unavailable</td></tr>';
+  }
+}
+setInterval(refreshSystemHealth, 3000);
+refreshSystemHealth();
+
 // speed buttons (they edit SPEED_MAX in the live config; hidden if the robot has no such key)
 const SPEED_KEY = 'SPEED_MAX', SPEED_STEP = 20, SPEED_LO = 100, SPEED_HI = 500;
 
@@ -1068,8 +1312,9 @@ async function nudgeSpeed(delta) {
   const cfg = await (await fetch('/api/config')).json();
   if (!(SPEED_KEY in cfg)) return;
   const v = Math.min(SPEED_HI, Math.max(SPEED_LO, cfg[SPEED_KEY] + delta));
-  await post('/api/config', {[SPEED_KEY]: v});
-  loadConfig();
+  const response = await post('/api/config', {[SPEED_KEY]: v});
+  const result = await response.json();
+  if (result.ok) loadConfig(); else alert('Speed update rejected');
 }
 $('spdUp').onclick = () => nudgeSpeed(SPEED_STEP);
 $('spdDn').onclick = () => nudgeSpeed(-SPEED_STEP);
@@ -1086,7 +1331,8 @@ async function loadConfig() {
     row.innerHTML = `<label>${k}</label><input type="number" step="${step}" value="${v}">`;
     row.querySelector('input').onchange = async e => {
       const r = await post('/api/config', {[k]: Number(e.target.value)});
-      showSpeed(await r.json());
+      const result = await r.json();
+      if (result.ok) showSpeed(result.config); else alert(Object.values(result.errors || {}).join('\n'));
     };
     $('config').appendChild(row);
   }
