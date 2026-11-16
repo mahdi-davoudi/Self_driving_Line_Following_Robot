@@ -63,6 +63,12 @@ uint8_t buffer_index = 0;
 
 bool avoiding = false;
 
+#define HEARTBEAT_TIMEOUT_MS 500UL
+
+unsigned long lastHeartbeatMs = 0;
+bool heartbeatReceived = false;
+bool watchdogTripped = true;
+
 // ================= HALL PULSE COUNTER =================
 volatile unsigned long pulseCount = 0;
 volatile unsigned long lastPulseUs = 0;
@@ -115,26 +121,111 @@ void driveChannel(int in_a, int in_b, int en_pin, int speed) {
   }
 }
 
+
 void motor(int L, int R) {
+  if (watchdogTripped && (L != 0 || R != 0)) {
+    L = 0;
+    R = 0;
+  }
+
   driveChannel(IN1, IN2, ENA, L);
   driveChannel(IN3, IN4, ENB, R);
 }
 
-// Drive (dir = DIR_FWD / DIR_BACK) until `pulses` Hall pulses have been counted.
-// stopAtEnd = false -> motors keep running (used between maneuver segments
-//                      that run back-to-back with no stop).
-// A timeout protects against a stalled wheel / dead sensor.
-void movePulses(int dir, unsigned long pulses, bool stopAtEnd) {
-  unsigned long start = getPulses();
-  unsigned long t0 = millis();
-  motor(dir * pwm_speed, dir * pwm_speed);
-  while ((getPulses() - start) < pulses) {
-    if (millis() - t0 > MOVE_TIMEOUT_MS) {
-      Serial.println("PULSE_TIMEOUT");
-      break;
+
+
+
+void handleHeartbeat() {
+  lastHeartbeatMs = millis();
+
+  if (!heartbeatReceived) {
+    heartbeatReceived = true;
+    watchdogTripped = false;
+    Serial.println("WATCHDOG_ARMED");
+  }
+}
+
+void checkWatchdog() {
+  if (!heartbeatReceived || watchdogTripped) {
+    return;
+  }
+
+  if (millis() - lastHeartbeatMs >= HEARTBEAT_TIMEOUT_MS) {
+    watchdogTripped = true;
+    motor(0, 0);
+    Serial.println("WATCHDOG_STOP");
+  }
+}
+
+void serviceHeartbeatSerial() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == '\r' || c == '\n') {
+      if (buffer_index > 0) {
+        serial_buffer[buffer_index] = '\0';
+
+        if (strcmp(serial_buffer, "HB") == 0) {
+          handleHeartbeat();
+        }
+
+        buffer_index = 0;
+      }
+    } else if (buffer_index < SERIAL_BUFFER_SIZE - 1) {
+      serial_buffer[buffer_index++] = c;
+    } else {
+      buffer_index = 0;
     }
   }
-  if (stopAtEnd) motor(0, 0);
+}
+
+bool safeDelay(unsigned long durationMs) {
+  unsigned long startMs = millis();
+
+  while (millis() - startMs < durationMs) {
+    serviceHeartbeatSerial();
+    checkWatchdog();
+
+    if (watchdogTripped) {
+      motor(0, 0);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+void movePulses(int dir, unsigned long pulses, bool stopAtEnd) {
+  if (watchdogTripped) {
+    motor(0, 0);
+    return;
+  }
+
+  unsigned long start = getPulses();
+  unsigned long t0 = millis();
+
+  motor(dir * pwm_speed, dir * pwm_speed);
+
+  while ((getPulses() - start) < pulses) {
+    serviceHeartbeatSerial();
+    checkWatchdog();
+
+    if (watchdogTripped) {
+      motor(0, 0);
+      return;
+    }
+
+    if (millis() - t0 > MOVE_TIMEOUT_MS) {
+      motor(0, 0);
+      Serial.println("PULSE_TIMEOUT");
+      return;
+    }
+  }
+
+  if (stopAtEnd) {
+    motor(0, 0);
+  }
 }
 
 // ================= PARAMETER UPLOAD =================
@@ -189,18 +280,18 @@ void loop() {
 
     steer(AV_A_STOP);
     motor(0, 0);
-    delay(1000);                                   // stand still
+    safeDelay(1000);                                   // stand still
     movePulses(DIR_BACK, AV_BACK_P, false);
 
     // left
     steer(AV_A_LEFT);
     movePulses(DIR_FWD, AV_LEFT_P, true);
-    delay(1000);
+    safeDelay(1000);
 
     // middle
     steer(AV_A_MID);
     movePulses(DIR_FWD, AV_MID_P, true);
-    delay(1000);
+    safeDelay(1000);
 
     // right, then final correction
     steer(AV_A_RIGHT);
@@ -210,7 +301,7 @@ void loop() {
 
     servoWrite(SERVO_CENTER);
     motor(0, 0);
-    delay(500);
+    safeDelay(500);
 
     avoiding = false;
   }
@@ -230,11 +321,16 @@ void loop() {
       buffer_index = 0;
     }
   }
+  checkWatchdog();
 }
 
 // ================= COMMANDS =================
 void processCommand() {
 
+  if (strcmp(serial_buffer, "HB") == 0) {
+    handleHeartbeat();
+    return;
+  }
   // ---- End of parameter upload ----
   if (strcmp(serial_buffer, "CFGEND") == 0) {
     cfgReady = true;
@@ -274,7 +370,7 @@ void processCommand() {
     digitalWrite(A1, 1);
     motor(0, 0);
     servoWrite(current_angle);
-    delay(1000);                         // stand still at the STOP sign
+    safeDelay(1000);                         // stand still at the STOP sign
     Serial.println("DONE");
     return;
   }
@@ -285,13 +381,13 @@ void processCommand() {
 
     motor(0, 0);
     steer(CW_A);
-    delay(CW_WAIT_MS);                   // stop at the crosswalk
+    safeDelay(CW_WAIT_MS);                   // stop at the crosswalk
     servoWrite(SERVO_CENTER);
-    delay(300);                          // let the servo reach the center
+    safeDelay(300);                          // let the servo reach the center
 
     movePulses(DIR_FWD, CW_FWD_P, true);
     motor(0, 0);
-    delay(2000);
+    safeDelay(2000);
 
     Serial.println("DONE");
     return;
@@ -300,10 +396,10 @@ void processCommand() {
   // ---- Straight ----
   if (strcmp(serial_buffer, "Fr") == 0) {
     motor(0, 0);
-    delay(300);
+    safeDelay(300);
     steer(FR_A);
     movePulses(DIR_FWD, FR_P, true);
-    delay(200);
+    safeDelay(200);
     Serial.println("DONE");
     return;
   }
@@ -319,7 +415,7 @@ void processCommand() {
     movePulses(DIR_FWD, RR_4_P, false);
     servoWrite(SERVO_CENTER);
     motor(0, 0);
-    delay(10);
+    safeDelay(10);
     Serial.println("DONE");
     return;
   }

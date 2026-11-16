@@ -76,15 +76,25 @@ if USE_DASHBOARD:
 
 # SERIAL
 LAST_CMD = None
+HEARTBEAT_INTERVAL = 0.2
 def send_command(command: bytes) -> bool:
     global LAST_CMD
-    if LAST_CMD == command:
+
+    is_heartbeat = command == b'HB\r\n'
+
+    if not is_heartbeat and LAST_CMD == command:
         return False
-    LAST_CMD = command
 
     if serial_connection is not None and serial_connection.is_open:
-        serial_connection.write(command)
-        return True
+        try:
+            serial_connection.write(command)
+            if not is_heartbeat:
+                LAST_CMD = command
+            return True
+        except serial.SerialException as e:
+            print(f"Serial write failed: {e}")
+            return False
+
     print(f"Serial connection not available for command: {command}")
     return False
 
@@ -498,6 +508,7 @@ class LaneTrackingVehicle:
         self.robot = RobotController()
         self.running = AUTO_START
         self.lane_missing_since = None
+        self.last_heartbeat = 0.0
         
         if USE_DASHBOARD:
             dashboard.state.config = self.config
@@ -537,6 +548,11 @@ class LaneTrackingVehicle:
                     line_info['error_max'],
                     line_info['lane_lost']
                 )
+                now = time.monotonic()
+                
+                if self.running and now - self.last_heartbeat >= HEARTBEAT_INTERVAL:
+                    if send_command(b'HB\r\n'):
+                        self.last_heartbeat = now
 
                 now = time.monotonic()
                 lane_type = line_info['lane_type']
