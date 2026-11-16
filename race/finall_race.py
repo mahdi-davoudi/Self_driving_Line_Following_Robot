@@ -20,6 +20,10 @@ TURN_SPEED_DROP = 15         # speed lost at the sharpest turn (use 10..15)
 UNCERTAIN_SPEED_CAP = 185    # max speed while a lane is being held/estimated
 ARDUINO_MAX_PWM = 210
 
+ONE_LINE_SPEED = 180
+BOTH_LINES_LOST_SPEED = 160
+LANE_LOST_STOP_SECONDS = 3
+
 # Steering gain parameters
 K_MIN = 0.3
 K_MAX = 1.5
@@ -177,18 +181,25 @@ class Steering:
         angle = STEER_CENTER + gain * error
         return max(STEER_MIN, min(STEER_MAX, angle))
 
-    def compute_speed(self, angle: float, lane_uncertain: bool) -> int:
+    def compute_speed(self, angle: float, lane_type: str) -> int:
+        """Calculate motor PWM according to lane detection confidence."""
+
+        if lane_type == "none":
+            return BOTH_LINES_LOST_SPEED
 
         turn_ratio = min(
             abs(angle - STEER_CENTER) / self.max_deviation,
             1.0
-        ) 
+        )
+
         speed = MAX_SPEED - TURN_SPEED_DROP * turn_ratio
-        if lane_uncertain:
-            speed = min(speed, UNCERTAIN_SPEED_CAP)
-        speed = int(round(speed))
-        speed = max(MIN_SPEED, min(MAX_SPEED, speed))
-        return speed
+
+        if lane_type in ("left", "right"):
+            speed = min(speed, ONE_LINE_SPEED)
+        else:
+            speed = max(MIN_SPEED, speed)
+
+        return int(round(max(0, min(MAX_SPEED, speed))))
 
 
 # ROBOT (serial output only)
@@ -216,10 +227,11 @@ class RobotController:
 
             send_command(command)
             self.speed_old = speed
-
-        # Apply the updated PWM to the motors
         send_command(b'F\r\n')
 
+    def stop(self) -> None:
+        send_command(b'STOP\r\n')
+        
     def close(self) -> None:
         send_command(b'STOP\r\n')
         if serial_connection is not None and serial_connection.is_open:
@@ -484,8 +496,9 @@ class LaneTrackingVehicle:
         self.vision = VisionProcessor(self.config)
         self.steering = Steering()
         self.robot = RobotController()
-
         self.running = AUTO_START
+        self.lane_missing_since = None
+        
         if USE_DASHBOARD:
             dashboard.state.config = self.config
             dashboard.calib.set_params({"GRAY_FROM_RGB": 1})   # this code converts with RGB2GRAY
@@ -520,10 +533,34 @@ class LaneTrackingVehicle:
                 lanes_frame, line_info = self.vision.detect_lines(frame)
 
                 angle = self.steering.compute_angle(
-                    line_info['error'], line_info['error_max'], line_info['lane_lost'])
-                speed = self.steering.compute_speed(angle, line_info['lane_uncertain'])
-                if self.running:
-                    self.robot.drive(angle, speed)
+                    line_info['error'],
+                    line_info['error_max'],
+                    line_info['lane_lost']
+                )
+
+                now = time.monotonic()
+                lane_type = line_info['lane_type']
+
+                if lane_type == "none":
+                    if self.lane_missing_since is None:
+                        self.lane_missing_since = now
+
+                    lost_duration = now - self.lane_missing_since
+                else:
+                    self.lane_missing_since = None
+                    lost_duration = 0.0
+
+                if lost_duration >= LANE_LOST_STOP_SECONDS:
+                    speed = 0
+
+                    if self.running:
+                        self.robot.stop()
+
+                else:
+                    speed = self.steering.compute_speed(angle, lane_type)
+
+                    if self.running:
+                        self.robot.drive(angle, speed)
 
                 frames += 1
                 if time.time() - last_log >= 1:
