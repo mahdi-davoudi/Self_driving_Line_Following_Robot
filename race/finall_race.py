@@ -6,9 +6,6 @@ import serial
 import math
 from typing import Tuple, Dict, Optional
 
-# ============================================================
-# CONSTANTS
-# ============================================================
 
 # Servo limits (must match the Arduino sketch)
 STEER_CENTER = 90
@@ -20,7 +17,8 @@ FALLBACK_ANGLE = STEER_CENTER + 25   # steering angle used when both lines are l
 MAX_SPEED = 210              # speed on a straight path
 MIN_SPEED = 180              # absolute lower limit
 TURN_SPEED_DROP = 15         # speed lost at the sharpest turn (use 10..15)
-UNCERTAIN_SPEED_CAP = 195    # max speed while a lane is being held/estimated
+UNCERTAIN_SPEED_CAP = 185    # max speed while a lane is being held/estimated
+ARDUINO_MAX_PWM = 210
 
 # Steering gain parameters
 K_MIN = 0.3
@@ -64,8 +62,7 @@ DEBUG_SHOW = False
 RIGHT_MIN_ABS_SLOPE = 0.4
 LEFT_MIN_ABS_SLOPE = 0.3
 
-# Web dashboard (dashboard.py). Set USE_DASHBOARD = False on race day: it removes
-# all dashboard work from the loop and dashboard.py / fastapi are not even imported.
+
 USE_DASHBOARD = True
 AUTO_START = True        # False -> the robot waits for the START button in the dashboard
 DASHBOARD_PORT = 8000
@@ -73,12 +70,8 @@ DASHBOARD_PORT = 8000
 if USE_DASHBOARD:
     import dashboard
 
-# ============================================================
 # SERIAL
-# ============================================================
 LAST_CMD = None
-
-
 def send_command(command: bytes) -> bool:
     global LAST_CMD
     if LAST_CMD == command:
@@ -93,7 +86,6 @@ def send_command(command: bytes) -> bool:
 
 
 def find_port() -> Optional[str]:
-    """Arduino Uno usually shows up as /dev/ttyACM0, clones (CH340) as /dev/ttyUSB0."""
     ports = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*')
     return ports[0] if ports else None
 
@@ -104,7 +96,7 @@ try:
         raise serial.SerialException("No Arduino port found")
     print("Using serial port:", port)
     serial_connection = serial.Serial(port, 115200, timeout=1)
-    time.sleep(2)   # the Arduino resets when the port is opened
+    time.sleep(2)  
     send_command(b'STOP\r\n')
     send_command(f'SPD{MIN_SPEED}\r\n'.encode())
     send_command(f'S{STEER_CENTER}\r\n'.encode())
@@ -113,12 +105,8 @@ except serial.SerialException as e:
     serial_connection = None
 
 
-# ============================================================
 # CAMERA
-# ============================================================
 class CameraConfig:
-    """Handles camera initialization and frame capture."""
-
     def __init__(self, width: int = F_Width, height: int = F_Height):
         self.width = width
         self.height = height
@@ -174,21 +162,12 @@ class CameraConfig:
             self.cap.release()
 
 
-# ============================================================
 # STEERING
-# ============================================================
 class Steering:
-    """Turns the lane error into a servo angle and a motor speed.
-
-    No smoothing is applied: the angle goes straight from the error to the servo.
-    """
-
     def __init__(self):
-        # Largest possible angle deviation from the center (used to scale the speed drop)
         self.max_deviation = max(STEER_MAX - STEER_CENTER, STEER_CENTER - STEER_MIN)
 
     def compute_angle(self, error: float, error_max: float, lane_lost: bool) -> float:
-        """error: line_center_x - frame_center (pixels). Positive -> steer right."""
         if lane_lost:
             return float(FALLBACK_ANGLE)
 
@@ -199,40 +178,46 @@ class Steering:
         return max(STEER_MIN, min(STEER_MAX, angle))
 
     def compute_speed(self, angle: float, lane_uncertain: bool) -> int:
-        """MAX_SPEED on a straight path, at most TURN_SPEED_DROP less in the sharpest turn."""
-        turn_ratio = min(abs(angle - STEER_CENTER) / self.max_deviation, 1.0)
-        speed = MAX_SPEED - TURN_SPEED_DROP * turn_ratio
 
-        # Safety cap while a lane is only being held/estimated (not freshly seen)
+        turn_ratio = min(
+            abs(angle - STEER_CENTER) / self.max_deviation,
+            1.0
+        ) 
+        speed = MAX_SPEED - TURN_SPEED_DROP * turn_ratio
         if lane_uncertain:
             speed = min(speed, UNCERTAIN_SPEED_CAP)
+        speed = int(round(speed))
+        speed = max(MIN_SPEED, min(MAX_SPEED, speed))
+        return speed
 
-        return int(round(max(MIN_SPEED, min(MAX_SPEED, speed))))
 
-
-# ============================================================
 # ROBOT (serial output only)
-# ============================================================
 class RobotController:
-    """Sends steering angle, speed and the drive command to the Arduino."""
-
     def __init__(self):
         self.angle_old = None
         self.speed_old = None
 
     def drive(self, angle: float, speed: int) -> None:
+
         angle = int(round(angle))
 
+        # Validate PWM before sending it to Arduino
+        speed = int(speed)
+        speed = max(0, min(ARDUINO_MAX_PWM, speed))
+
+        # Send steering angle
         if angle != self.angle_old:
             send_command(f'S{angle}\r\n'.encode())
             self.angle_old = angle
 
+        # Send speed to Arduino
         if speed != self.speed_old:
-            send_command(f'SPD{speed}\r\n'.encode())
+            command = f'SPD{speed}\r\n'.encode()
+
+            send_command(command)
             self.speed_old = speed
 
-        # The Arduino applies a new SPD value only on the next 'F' command,
-        # so 'F' is sent after the speed. send_command skips exact duplicates.
+        # Apply the updated PWM to the motors
         send_command(b'F\r\n')
 
     def close(self) -> None:
@@ -241,12 +226,8 @@ class RobotController:
             serial_connection.close()
 
 
-# ============================================================
 # VISION
-# ============================================================
 class VisionProcessor:
-    """Handles lane detection. Returns measurements only (no steering logic)."""
-
     def __init__(self, config: dict):
         self.config = config
         # Per-side memory: last known center position + how many consecutive
@@ -347,7 +328,6 @@ class VisionProcessor:
         right_detected_raw = center_right_x_raw is not None
         left_detected_raw = center_left_x_raw is not None
 
-        # ---- Update running lane-width estimate ----
         # Only trust frames where BOTH lines were freshly detected.
         if right_detected_raw and left_detected_raw:
             current_width = center_right_x_raw - center_left_x_raw
@@ -387,7 +367,7 @@ class VisionProcessor:
                 center_right_x = right_rl + 10
                 right_confident = False
 
-        # ---- Resolve LEFT line position + confidence (mirrors the right side) ----
+        #  Resolve LEFT line position + confidence (mirrors the right side)
         if left_detected_raw:
             center_left_x = center_left_x_raw
             self.last_center_left_x = center_left_x
@@ -521,7 +501,6 @@ class LaneTrackingVehicle:
             self.running = True
 
     def run(self) -> None:
-        """Starts driving immediately (unless AUTO_START is False). Stop with Ctrl+C."""
         print("Robot started. Press Ctrl+C to stop.")
         try:
             last_log, frames, fps = time.time(), 0, 0
