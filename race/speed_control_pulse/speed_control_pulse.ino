@@ -43,7 +43,7 @@ bool cfgReady = false;
 #define DIR_BACK -1
 
 // ================= LIMITS =================
-#define MAX_SPEED     120   // absolute PWM safety limit (0..255)
+#define MAX_SPEED     210  // absolute PWM safety limit (0..255)
 
 #define SERVO_CENTER  90
 #define SERVO_MIN     45
@@ -95,15 +95,19 @@ void steer(int oldAngle) {
 
 // ================= MOTORS =================
 void driveChannel(int in_a, int in_b, int en_pin, int speed) {
+
   speed = constrain(speed, -MAX_SPEED, MAX_SPEED);
+
   if (speed > 0) {
     digitalWrite(in_a, HIGH);
     digitalWrite(in_b, LOW);
     analogWrite(en_pin, speed);
+
   } else if (speed < 0) {
     digitalWrite(in_a, LOW);
     digitalWrite(in_b, HIGH);
     analogWrite(en_pin, -speed);
+
   } else {
     digitalWrite(in_a, LOW);
     digitalWrite(in_b, LOW);
@@ -356,20 +360,30 @@ void processCommand() {
     return;
   }
 
-  // ---- Speed command: SPD<value>, e.g. SPD60 ----
+  // Speed command: SPD
   if (strncmp(serial_buffer, "SPD", 3) == 0) {
-    char *endptr = nullptr;
-    long requested_speed = strtol(serial_buffer + 3, &endptr, 10);
 
-    // Accept only a numeric value after SPD; ignore malformed commands.
-    if (endptr == serial_buffer + 3 || *endptr != '\0') {
+      char *endptr = nullptr;
+
+      long requested_speed = strtol(
+          serial_buffer + 3,
+          &endptr,
+          10
+      );
+
+      if (endptr == serial_buffer + 3 || *endptr != '\0') {
+          return;
+      }
+
+      pwm_speed = (int)constrain(
+          requested_speed,
+          0L,
+          (long)MAX_SPEED
+      );
+
+      current_speed = pwm_speed;
+
       return;
-    }
-
-    // Clamp to the supported PWM range, then use it for all movements.
-    pwm_speed = (int)constrain(requested_speed, 0L, (long)MAX_SPEED);
-    current_speed = pwm_speed;
-    return;
   }
 
   // ---- Steering command: S<angle> (absolute, 45..135) ----
