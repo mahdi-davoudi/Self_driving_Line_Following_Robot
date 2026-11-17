@@ -45,6 +45,7 @@ from pathlib import Path
 from collections import deque
 
 import cv2
+from lane_geometry import detect_side as shared_detect_side
 import numpy as np
 import uvicorn
 from fastapi import FastAPI, Request, WebSocket
@@ -68,7 +69,7 @@ F_Height = 216
 CALIB_MAX_FPS = 15            # cap for the calibration thread (0 = unlimited). Saves CPU on the Pi.
 STATS_HISTORY = 20000         # max stored width/offset samples
 MIN_SAMPLES_WIDTH = 30        # frames with BOTH lines needed before trusting the width
-MIN_STREAK_EVENTS = 3         # lost-line episodes needed before suggesting LANE_HOLD_FRAMES
+MIN_STREAK_EVENTS = 3         # lost-line episodes needed before suggesting hold seconds
 HOLD_SAFETY_FACTOR = 1.5      # suggested hold = longest observed gap * this factor
 WIDTH_STD_WARN_PX = 12        # width std above this -> measurement is unstable
 OFFSET_WARN_PX = 6            # |center offset| above this -> camera/robot not centered
@@ -94,6 +95,18 @@ PARAM_SPEC = {
     "ROI_BOTTOM_LL":       (1.0, 0.0, 1.0, 0.01, "Left lane ROI"),
     "ROI_LEFT_LL":         (0.0, 0.0, 1.0, 0.01, "Left lane ROI"),
     "ROI_RIGHT_LL":        (0.4, 0.0, 1.0, 0.01, "Left lane ROI"),
+    "LANE_HOLD_TIME_SEC": (0.4, 0.05, 2.0, 0.05, "Lane hold (seconds)"),
+    "LANE_WIDTH_EMA_ALPHA": (0.05, 0.01, 0.5, 0.01, "Lane width"),
+    "LANE_WIDTH_INIT_PX": (140, 30, 300, 1, "Lane width"),
+    "LANE_WIDTH_MIN_PX": (95, 20, 300, 1, "Lane width"),
+    "LANE_WIDTH_MAX_PX": (220, 30, 380, 1, "Lane width"),
+    "LANE_WIDTH_MAX_CHANGE_PX": (25, 1, 150, 1, "Lane width"),
+    "LANE_WIDTH_MAX_STEP_PX": (2.0, 0.1, 15, 0.1, "Lane width"),
+    "LINE_MIN_ANGLE_DEG": (24.0, 0, 88, 1, "Robust line filter"),
+    "LINE_MAX_ANGLE_DEG": (88.0, 2, 90, 1, "Robust line filter"),
+    "LINE_BOTTOM_TOLERANCE_PX": (22, 2, 100, 1, "Robust line filter"),
+    "LINE_ANGLE_TOLERANCE_DEG": (18, 2, 60, 1, "Robust line filter"),
+    "LINE_EXTRAPOLATION_MARGIN_PX": (25, 0, 100, 1, "Robust line filter"),
     "GRAY_FROM_RGB":       (0, 0, 1, 1, "Input (1 = frames are RGB, like Picamera2 in the race code)"),
 }
 
@@ -183,49 +196,8 @@ def _roi_bounds(height, width, top, bottom, left, right):
 
 
 def _detect_side(gray, bounds, side, p):
-    """Returns a dict: center_x (full-frame x or None), kept/rejected lines (full-frame coords), edges image."""
-    top, bottom, left, right = bounds
-    frame_center = gray.shape[1] // 2
-    out = {"center_x": None, "kept": [], "rejected": [], "edges": None}
-
-    if bottom - top < 4 or right - left < 4:      # degenerate ROI -> nothing to analyse
-        out["edges"] = np.zeros((8, 8), np.uint8)
-        return out
-
-    roi = gray[top:bottom, left:right]
-    edges = cv2.Canny(roi, p["CANNY_LOW"], p["CANNY_HIGH"])
-    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, int(p["HOUGH_THRESHOLD"]),
-                            minLineLength=int(p["MIN_LINE_LENGTH"]), maxLineGap=int(p["MAX_LINE_GAP"]))
-    out["edges"] = edges
-
-    min_slope = p["RIGHT_MIN_ABS_SLOPE"] if side == "right" else p["LEFT_MIN_ABS_SLOPE"]
-    roi_h = roi.shape[0]
-    bottoms = []
-
-    if lines is not None:
-        for line in lines:
-            x1, y1, x2, y2 = (int(v) for v in line.flatten())
-            seg = (x1 + left, y1 + top, x2 + left, y2 + top)
-            if x2 == x1:                               # vertical lines are skipped, same as the race code
-                out["rejected"].append(seg)
-                continue
-            slope = (y2 - y1) / (x2 - x1)
-            if abs(slope) <= min_slope:
-                out["rejected"].append(seg)
-                continue
-            x_bottom = x1 + (roi_h - y1) / slope if abs(slope) > 1e-5 else x1
-            x_bottom = max(0, min(right - left - 1, x_bottom))
-            x_bottom_full = x_bottom + left
-            on_correct_side = (x_bottom_full >= frame_center) if side == "right" else (x_bottom_full <= frame_center)
-            if on_correct_side:
-                bottoms.append(x_bottom_full)
-                out["kept"].append(seg)
-            else:
-                out["rejected"].append(seg)
-
-    out["center_x"] = float(np.mean(bottoms)) if bottoms else None
-    return out
+    """Use exactly the same robust detector as the live driving process."""
+    return shared_detect_side(gray, bounds, side, p)
 
 
 def analyze_frame(frame, p):
@@ -387,7 +359,7 @@ class Stats:
         out["gap_events"] = len(gaps)
         if len(gaps) >= MIN_STREAK_EVENTS:
             out["longest"] = max(gaps)
-            out["hold"] = max(3, int(math.ceil(out["longest"] * HOLD_SAFETY_FACTOR)))
+            out["hold"] = round(max(0.05, out["longest"] * HOLD_SAFETY_FACTOR / max(self.fps, 1)), 2)
         return out
 
     def summary(self):
@@ -428,7 +400,7 @@ class Stats:
             fps = self.fps
             secs = f"{s['longest'] / fps:.2f} s at {fps:.1f} FPS" if fps > 0 else "? s"
             out.append(f"  longest gap = {s['longest']} frames (~{secs})")
-            out.append(f"  -> LANE_HOLD_FRAMES = {s['hold']}   (longest gap x {HOLD_SAFETY_FACTOR})")
+            out.append(f"  -> LANE_HOLD_TIME_SEC = {s['hold']}   (approximate; gap samples / average FPS)")
             out.append("  NOTE: valid only if you moved along the track at about the real robot speed.")
         else:
             out.append(f"  not enough gaps seen ({s['gap_events']}/{MIN_STREAK_EVENTS}). Move the camera along "
@@ -493,7 +465,9 @@ class CalibWorker:
                     continue
             pairs = (("CANNY_LOW", "CANNY_HIGH"), ("ROI_TOP_RL", "ROI_BOTTOM_RL"),
                      ("ROI_LEFT_RL", "ROI_RIGHT_RL"), ("ROI_TOP_LL", "ROI_BOTTOM_LL"),
-                     ("ROI_LEFT_LL", "ROI_RIGHT_LL"))
+                     ("ROI_LEFT_LL", "ROI_RIGHT_LL"),
+                      ("LANE_WIDTH_MIN_PX", "LANE_WIDTH_MAX_PX"),
+                      ("LINE_MIN_ANGLE_DEG", "LINE_MAX_ANGLE_DEG"))
             if all(candidate[a] < candidate[b] for a, b in pairs):
                 self.params = candidate
                 self.version += 1
@@ -588,7 +562,7 @@ class CalibWorker:
         if sug["width"] is not None:
             measured.append(f"LANE_WIDTH_INIT_PX = {int(round(sug['width']))}")
         if sug["hold"] is not None:
-            measured.append(f"LANE_HOLD_FRAMES = {sug['hold']}")
+            measured.append(f"LANE_HOLD_TIME_SEC = {sug['hold']}")
         if measured:
             lines.append("")
             lines.append("# Measured")

@@ -62,6 +62,7 @@ char serial_buffer[SERIAL_BUFFER_SIZE];
 uint8_t buffer_index = 0;
 
 bool avoiding = false;
+bool abortRequested = true;  // STOP is latched until an explicit ARM
 
 #define HEARTBEAT_TIMEOUT_MS 500UL
 
@@ -123,7 +124,7 @@ void driveChannel(int in_a, int in_b, int en_pin, int speed) {
 
 
 void motor(int L, int R) {
-  if (watchdogTripped && (L != 0 || R != 0)) {
+  if ((watchdogTripped || abortRequested) && (L != 0 || R != 0)) {
     L = 0;
     R = 0;
   }
@@ -152,6 +153,7 @@ void checkWatchdog() {
 
   if (millis() - lastHeartbeatMs >= HEARTBEAT_TIMEOUT_MS) {
     watchdogTripped = true;
+    abortRequested = true;
     motor(0, 0);
     Serial.println("WATCHDOG_STOP");
   }
@@ -167,8 +169,12 @@ void serviceHeartbeatSerial() {
 
         if (strcmp(serial_buffer, "HB") == 0) {
           handleHeartbeat();
+        } else if (strcmp(serial_buffer, "STOP") == 0 || strcmp(serial_buffer, "ST") == 0) {
+          abortRequested = true;
+          motor(0, 0);
+          Serial.println("STOPPED");
         }
-
+        // Other commands are deliberately ignored during blocking maneuvers.
         buffer_index = 0;
       }
     } else if (buffer_index < SERIAL_BUFFER_SIZE - 1) {
@@ -186,7 +192,7 @@ bool safeDelay(unsigned long durationMs) {
     serviceHeartbeatSerial();
     checkWatchdog();
 
-    if (watchdogTripped) {
+    if (watchdogTripped || abortRequested) {
       motor(0, 0);
       return false;
     }
@@ -197,7 +203,7 @@ bool safeDelay(unsigned long durationMs) {
 
 
 void movePulses(int dir, unsigned long pulses, bool stopAtEnd) {
-  if (watchdogTripped) {
+  if (watchdogTripped || abortRequested) {
     motor(0, 0);
     return;
   }
@@ -211,7 +217,7 @@ void movePulses(int dir, unsigned long pulses, bool stopAtEnd) {
     serviceHeartbeatSerial();
     checkWatchdog();
 
-    if (watchdogTripped) {
+    if (watchdogTripped || abortRequested) {
       motor(0, 0);
       return;
     }
@@ -259,6 +265,7 @@ void setup() {
   display.setBrightness(7);
   myservo.attach(9);
   servoWrite(current_angle);
+  abortRequested = true;
   motor(0, 0);
 
   // Moderate PWM at start; Python can change it with SPD<value>.
@@ -274,7 +281,7 @@ void loop() {
   Serial.println(d);
 
   // ---- Obstacle avoidance (only after Python has uploaded the parameters) ----
-  if (cfgReady && !avoiding && d > 0 && d <= 40) {
+  if (cfgReady && !avoiding && !abortRequested && !watchdogTripped && d > 0 && d <= 40) {
     Serial.println(d);
     avoiding = true;
 
@@ -331,11 +338,37 @@ void processCommand() {
     handleHeartbeat();
     return;
   }
+  // ARM is explicit: HB alone must never clear a watchdog failure.
+  if (strcmp(serial_buffer, "ARM") == 0) {
+    if (!avoiding) {
+      abortRequested = false;
+      watchdogTripped = false;
+      heartbeatReceived = true;
+      lastHeartbeatMs = millis();
+      Serial.println("ARMED");
+    }
+    return;
+  }
+  if (strcmp(serial_buffer, "STOP") == 0 || strcmp(serial_buffer, "ST") == 0) {
+    abortRequested = true;
+    motor(0, 0);
+    Serial.println("STOPPED");
+    return;
+  }
   // ---- End of parameter upload ----
   if (strcmp(serial_buffer, "CFGEND") == 0) {
     cfgReady = true;
     Serial.println("CFG_OK");
     return;
+  }
+
+  if (watchdogTripped || abortRequested) {
+    if (strcmp(serial_buffer, "C") == 0 || strcmp(serial_buffer, "Fr") == 0 ||
+        strcmp(serial_buffer, "RR") == 0 || strcmp(serial_buffer, "LL") == 0 ||
+        strcmp(serial_buffer, "SS") == 0) {
+      Serial.println("NOT_ARMED");
+      return;
+    }
   }
 
   // ---- Maneuvers need the parameters from Python ----
@@ -358,6 +391,7 @@ void processCommand() {
 
   // ---- Forward ----
   if (strcmp(serial_buffer, "F") == 0) {
+    if (watchdogTripped || abortRequested) return;
     display.showNumberDec(4);
     motor(pwm_speed, pwm_speed);
     return;
@@ -447,12 +481,8 @@ void processCommand() {
   }
 
   if (strcmp(serial_buffer, "B") == 0) {
+    if (watchdogTripped || abortRequested) return;
     motor(-pwm_speed, -pwm_speed);
-    return;
-  }
-
-  if (strcmp(serial_buffer, "STOP") == 0) {
-    motor(0, 0);
     return;
   }
 
