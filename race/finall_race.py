@@ -4,6 +4,8 @@ import time
 import glob
 import serial
 import math
+from collections import deque
+from lane_geometry import detect_side
 from typing import Tuple, Dict, Optional
 
 
@@ -39,9 +41,19 @@ MAX_LINE_GAP = 60
 # When a lane is not detected in the current frame, hold the last known position
 # (or estimate it from the other lane) for a short window, and only fall back
 # to a fixed steering angle once that window is exceeded.
-LANE_HOLD_FRAMES = 10        # frames to keep using last-known/estimated position
+LANE_HOLD_TIME_SEC = 0.4    # monotonic seconds, independent of FPS
 LANE_WIDTH_EMA_ALPHA = 0.05  # how fast the estimated lane width (px) adapts
-LANE_WIDTH_INIT_PX = 140     # initial lane width guess in pixels -- tune to your track
+LANE_WIDTH_INIT_PX = 140     # tune to track at 384x216
+LANE_WIDTH_MIN_PX = 95
+LANE_WIDTH_MAX_PX = 220
+LANE_WIDTH_MAX_CHANGE_PX = 25  # reject abrupt measured jumps
+LANE_WIDTH_MAX_STEP_PX = 2.0   # per accepted update, after EMA
+LANE_WIDTH_MEDIAN_WINDOW = 7
+LINE_MIN_ANGLE_DEG = 24.0
+LINE_MAX_ANGLE_DEG = 88.0
+LINE_BOTTOM_TOLERANCE_PX = 22
+LINE_ANGLE_TOLERANCE_DEG = 18
+LINE_EXTRAPOLATION_MARGIN_PX = 25
 
 # Frame size
 F_Width = 384
@@ -74,49 +86,67 @@ DASHBOARD_PORT = 8000
 if USE_DASHBOARD:
     import dashboard
 
-# SERIAL
-LAST_CMD = None
+# SERIAL. A successful write means OS-buffered, not Arduino-executed.
 HEARTBEAT_INTERVAL = 0.2
-def send_command(command: bytes) -> bool:
-    global LAST_CMD
+serial_connection = None
+serial_error = None
+_serial_cache = {}
 
-    is_heartbeat = command == b'HB\r\n'
+class SerialControlError(RuntimeError):
+    pass
 
-    if not is_heartbeat and LAST_CMD == command:
-        return False
 
-    if serial_connection is not None and serial_connection.is_open:
-        try:
-            serial_connection.write(command)
-            if not is_heartbeat:
-                LAST_CMD = command
-            return True
-        except serial.SerialException as e:
-            print(f"Serial write failed: {e}")
-            return False
-
-    print(f"Serial connection not available for command: {command}")
-    return False
+def send_command(command: bytes, *, force=False) -> bool:
+    global serial_error, serial_connection
+    if serial_error is not None:
+        raise SerialControlError(serial_error)
+    if serial_connection is None or not serial_connection.is_open:
+        serial_error = 'Arduino serial port disconnected'
+        raise SerialControlError(serial_error)
+    kind = (b'SPD' if command.startswith(b'SPD') else
+            b'S' if command.startswith(b'S') and command[1:2].isdigit() else command.rstrip())
+    # STOP and HB are never deduplicated. F is retransmitted only if not already active.
+    if not force and kind not in (b'STOP', b'HB') and _serial_cache.get(kind) == command:
+        return True  # already sent successfully in this session
+    try:
+        count = serial_connection.write(command)
+        if count != len(command):
+            raise SerialControlError(f'Partial serial write {count}/{len(command)}')
+        if kind == b'STOP':
+            _serial_cache.pop(b'F', None)
+        else:
+            _serial_cache[kind] = command
+        return True
+    except (serial.SerialException, OSError, SerialControlError) as exc:
+        serial_error = f'Serial write failed: {exc}'
+        _serial_cache.clear()
+        raise SerialControlError(serial_error) from exc
 
 
 def find_port() -> Optional[str]:
-    ports = glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*')
+    ports = sorted(glob.glob('/dev/ttyACM*') + glob.glob('/dev/ttyUSB*'))
     return ports[0] if ports else None
 
 
-try:
-    port = find_port()
-    if port is None:
-        raise serial.SerialException("No Arduino port found")
-    print("Using serial port:", port)
-    serial_connection = serial.Serial(port, 115200, timeout=1)
-    time.sleep(2)  
-    send_command(b'STOP\r\n')
-    send_command(f'SPD{MIN_SPEED}\r\n'.encode())
-    send_command(f'S{STEER_CENTER}\r\n'.encode())
-except serial.SerialException as e:
-    print("Failed to initialize serial port. Robot control disabled.", e)
-    serial_connection = None
+def init_serial():
+    global serial_connection, serial_error
+    try:
+        port = find_port()
+        if not port:
+            raise serial.SerialException('No Arduino port found')
+        serial_connection = serial.Serial(port, 115200, timeout=0.1, write_timeout=0.2)
+        print('Using serial port:', port)
+        time.sleep(2)  # reset after opening serial
+        send_command(b'STOP\r\n')
+        send_command(f'SPD{MIN_SPEED}\r\n'.encode())
+        send_command(f'S{STEER_CENTER}\r\n'.encode())
+    except (serial.SerialException, OSError, SerialControlError) as exc:
+        serial_error = f'Serial initialization failed: {exc}'
+        print('[FAULT]', serial_error)
+        if serial_connection is not None:
+            try: serial_connection.close()
+            except Exception: pass
+        serial_connection = None
 
 
 # CAMERA
@@ -219,233 +249,114 @@ class RobotController:
         self.speed_old = None
 
     def drive(self, angle: float, speed: int) -> None:
-
-        angle = int(round(angle))
-
-        # Validate PWM before sending it to Arduino
-        speed = int(speed)
-        speed = max(0, min(ARDUINO_MAX_PWM, speed))
-
-        # Send steering angle
+        angle = max(STEER_MIN, min(STEER_MAX, int(round(angle))))
+        speed = max(0, min(ARDUINO_MAX_PWM, int(speed)))
         if angle != self.angle_old:
-            send_command(f'S{angle}\r\n'.encode())
-            self.angle_old = angle
-
-        # Send speed to Arduino
+            if send_command(f'S{angle}\r\n'.encode()):
+                self.angle_old = angle
         if speed != self.speed_old:
-            command = f'SPD{speed}\r\n'.encode()
-
-            send_command(command)
-            self.speed_old = speed
+            if send_command(f'SPD{speed}\r\n'.encode()):
+                self.speed_old = speed
         send_command(b'F\r\n')
 
     def stop(self) -> None:
         send_command(b'STOP\r\n')
-        
+
     def close(self) -> None:
-        send_command(b'STOP\r\n')
         if serial_connection is not None and serial_connection.is_open:
-            serial_connection.close()
+            try:
+                if serial_error is None:
+                    send_command(b'STOP\r\n')
+            except SerialControlError:
+                pass
+            finally:
+                try: serial_connection.close()
+                except (OSError, serial.SerialException): pass
 
 
 # VISION
 class VisionProcessor:
     def __init__(self, config: dict):
         self.config = config
-        # Per-side memory: last known center position + how many consecutive
-        # frames it has been since that side was actually (raw) detected.
         self.last_center_left_x = None
         self.last_center_right_x = None
-        self.left_lost_frames = 0
-        self.right_lost_frames = 0
-
-        # Running estimate of lane width in pixels (center_right_x - center_left_x),
-        # updated only on frames where BOTH lines are freshly detected.
-        self.estimated_lane_width = None
+        self.last_seen_left = None
+        self.last_seen_right = None
+        self.estimated_lane_width = float(LANE_WIDTH_INIT_PX)
+        self.width_history = deque(maxlen=LANE_WIDTH_MEDIAN_WINDOW)
 
     def detect_lines(self, frame: np.ndarray) -> Tuple[Optional[np.ndarray], Dict[str, float]]:
-        height, width = frame.shape[:2]
-        frame_center = width // 2
-        error_max = frame_center  # max possible pixel error
-
-        right_lines_info = []
-        left_lines_info = []
-        longest_line_length = 0
-
-        # Right lane ROI
-        top_rl = int(height * self.config['ROI_TOP_RL'])
-        bottom_rl = int(height * self.config['ROI_BOTTOM_RL'])
-        left_rl = int(width * self.config['ROI_LEFT_RL'])
-        right_rl = int(width * self.config['ROI_RIGHT_RL'])
-
-        # Left lane ROI
-        top_ll = int(height * self.config['ROI_TOP_LL'])
-        bottom_ll = int(height * self.config['ROI_BOTTOM_LL'])
-        left_ll = int(width * self.config['ROI_LEFT_LL'])
-        right_ll = int(width * self.config['ROI_RIGHT_LL'])
-
-        # Convert to gray ONCE per frame; both ROIs are slices of this image
+        h, w = frame.shape[:2]
+        frame_center = w // 2
+        p = self.config
+        rb = (int(h*p['ROI_TOP_RL']), int(h*p['ROI_BOTTOM_RL']),
+              int(w*p['ROI_LEFT_RL']), int(w*p['ROI_RIGHT_RL']))
+        lb = (int(h*p['ROI_TOP_LL']), int(h*p['ROI_BOTTOM_LL']),
+              int(w*p['ROI_LEFT_LL']), int(w*p['ROI_RIGHT_LL']))
         gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
-        gray_rl = gray[top_rl:bottom_rl, left_rl:right_rl]
-        gray_ll = gray[top_ll:bottom_ll, left_ll:right_ll]
-
-        # Process right lane
-        edge_rl = cv2.Canny(gray_rl, self.config['CANNY_LOW'], self.config['CANNY_HIGH'])
-        edge_dilated_rl = cv2.dilate(edge_rl, np.ones((3, 3), np.uint8), iterations=1)
-        lines_rl = cv2.HoughLinesP(edge_dilated_rl, 1, np.pi / 180, self.config['HOUGH_THRESHOLD'],
-                                   minLineLength=self.config['MIN_LINE_LENGTH'], maxLineGap=self.config['MAX_LINE_GAP'])
-
-        # center_right_x_raw / center_left_x_raw: only set when the line is
-        # actually found in THIS frame.
-        center_right_x_raw = None
-        if lines_rl is not None:
-            right_lines = []
-            roi_height_rl = gray_rl.shape[0]
-            for line in lines_rl:
-                x1, y1, x2, y2 = line.flatten()
-                if x2 != x1:
-                    slope = (y2 - y1) / (x2 - x1)
-                    if abs(slope) > self.config['RIGHT_MIN_ABS_SLOPE']:
-                        length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-                        x_bottom = x1 + (roi_height_rl - y1) / slope if abs(slope) > 1e-5 else x1
-                        x_bottom = max(0, min(right_rl - left_rl - 1, x_bottom))
-                        x_bottom_full = x_bottom + left_rl
-                        if x_bottom_full >= frame_center:
-                            right_lines.append((x1, y1, x2, y2, x_bottom, length))
-                            right_lines_info.append((x1, y1, x2, y2, length))
-
-            if right_lines:
-                x_bottom_sum = sum(line[4] + left_rl for line in right_lines)
-                center_right_x_raw = x_bottom_sum / len(right_lines)
-                longest_line_length = max(longest_line_length, int(max(line[5] for line in right_lines)))
-
-        # Process left lane
-        edge_ll = cv2.Canny(gray_ll, self.config['CANNY_LOW'], self.config['CANNY_HIGH'])
-        edge_dilated_ll = cv2.dilate(edge_ll, np.ones((3, 3), np.uint8), iterations=1)
-        lines_ll = cv2.HoughLinesP(edge_dilated_ll, 1, np.pi / 180, self.config['HOUGH_THRESHOLD'],
-                                   minLineLength=self.config['MIN_LINE_LENGTH'], maxLineGap=self.config['MAX_LINE_GAP'])
-
-        center_left_x_raw = None
-        if lines_ll is not None:
-            left_lines = []
-            roi_height_ll = gray_ll.shape[0]
-            for line in lines_ll:
-                x1, y1, x2, y2 = line.flatten()
-                if x2 != x1:
-                    slope = (y2 - y1) / (x2 - x1)
-                    if abs(slope) > self.config['LEFT_MIN_ABS_SLOPE']:
-                        length = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-                        x_bottom = x1 + (roi_height_ll - y1) / slope if abs(slope) > 1e-5 else x1
-                        x_bottom = max(0, min(right_ll - left_ll - 1, x_bottom))
-                        x_bottom_full = x_bottom + left_ll
-                        if x_bottom_full <= frame_center:
-                            left_lines.append((x1, y1, x2, y2, x_bottom, length))
-                            left_lines_info.append((x1, y1, x2, y2, length))
-
-            if left_lines:
-                x_bottom_sum = sum(line[4] + left_ll for line in left_lines)
-                center_left_x_raw = x_bottom_sum / len(left_lines)
-                longest_line_length = max(longest_line_length, int(max(line[5] for line in left_lines)))
-
-        right_detected_raw = center_right_x_raw is not None
-        left_detected_raw = center_left_x_raw is not None
-
-        # Only trust frames where BOTH lines were freshly detected.
-        if right_detected_raw and left_detected_raw:
-            current_width = center_right_x_raw - center_left_x_raw
-            if current_width > 0:
-                if self.estimated_lane_width is None:
-                    self.estimated_lane_width = current_width
-                else:
-                    self.estimated_lane_width = (
-                        LANE_WIDTH_EMA_ALPHA * current_width
-                        + (1 - LANE_WIDTH_EMA_ALPHA) * self.estimated_lane_width
-                    )
-        lane_width = self.estimated_lane_width if self.estimated_lane_width is not None else LANE_WIDTH_INIT_PX
-
-        # ---- Resolve RIGHT line position + confidence ----
-        # Priority when not detected this frame:
-        #   1) estimate from the (raw) left line + known lane width (adapts to turns)
-        #   2) hold the last known right position
-        #   3) give up -> not confident (triggers the safe fallback steering)
-        if right_detected_raw:
-            center_right_x = center_right_x_raw
-            self.last_center_right_x = center_right_x
-            self.right_lost_frames = 0
-            right_confident = True
-        else:
-            self.right_lost_frames += 1
-            if self.right_lost_frames <= LANE_HOLD_FRAMES:
-                if left_detected_raw:
-                    center_right_x = center_left_x_raw + lane_width
-                    right_confident = True
-                elif self.last_center_right_x is not None:
-                    center_right_x = self.last_center_right_x
-                    right_confident = True
-                else:
-                    center_right_x = right_rl + 10
-                    right_confident = False
+        right = detect_side(gray, rb, 'right', p)
+        left = detect_side(gray, lb, 'left', p)
+        rx, lx = right['center_x'], left['center_x']
+        raw_right, raw_left = rx is not None, lx is not None
+        now = time.monotonic()
+        if raw_right and raw_left:
+            measured = rx - lx
+            prev = self.estimated_lane_width
+            if (p['LANE_WIDTH_MIN_PX'] <= measured <= p['LANE_WIDTH_MAX_PX'] and
+                    abs(measured - prev) <= p['LANE_WIDTH_MAX_CHANGE_PX']):
+                self.width_history.append(measured)
+                median = float(np.median(self.width_history))
+                delta = p['LANE_WIDTH_EMA_ALPHA'] * (median - prev)
+                delta = max(-p['LANE_WIDTH_MAX_STEP_PX'], min(p['LANE_WIDTH_MAX_STEP_PX'], delta))
+                self.estimated_lane_width = max(p['LANE_WIDTH_MIN_PX'],
+                                                min(p['LANE_WIDTH_MAX_PX'], prev + delta))
+        lane_width = self.estimated_lane_width
+        if raw_right:
+            self.last_seen_right, self.last_center_right_x = now, rx
+        if raw_left:
+            self.last_seen_left, self.last_center_left_x = now, lx
+        hold = float(p['LANE_HOLD_TIME_SEC'])
+        valid_r = raw_right or (self.last_seen_right is not None and now - self.last_seen_right <= hold)
+        valid_l = raw_left or (self.last_seen_left is not None and now - self.last_seen_left <= hold)
+        if not raw_right:
+            if valid_r and raw_left:
+                rx = lx + lane_width
+            elif valid_r:
+                rx = self.last_center_right_x
             else:
-                center_right_x = right_rl + 10
-                right_confident = False
-
-        #  Resolve LEFT line position + confidence (mirrors the right side)
-        if left_detected_raw:
-            center_left_x = center_left_x_raw
-            self.last_center_left_x = center_left_x
-            self.left_lost_frames = 0
-            left_confident = True
-        else:
-            self.left_lost_frames += 1
-            if self.left_lost_frames <= LANE_HOLD_FRAMES:
-                if right_detected_raw:
-                    center_left_x = center_right_x_raw - lane_width
-                    left_confident = True
-                elif self.last_center_left_x is not None:
-                    center_left_x = self.last_center_left_x
-                    left_confident = True
-                else:
-                    center_left_x = left_ll
-                    left_confident = False
+                rx = None
+        if not raw_left:
+            if valid_l and raw_right:
+                lx = rx - lane_width
+            elif valid_l:
+                lx = self.last_center_left_x
             else:
-                center_left_x = left_ll
-                left_confident = False
-
-        # True when at least one line was not freshly seen this frame
-        # (used to reduce speed while the position is a guess).
-        lane_uncertain = not (right_detected_raw and left_detected_raw)
-
-        # True when both sides are lost beyond the hold window.
-        lane_lost = not right_confident and not left_confident
-
-        lane_type = ("both" if right_detected_raw and left_detected_raw
-                     else "right" if right_detected_raw
-                     else "left" if left_detected_raw
-                     else "none")
-
-        line_center_x = (center_right_x + center_left_x) / 2
-        target_x = frame_center
-        error = line_center_x - target_x
-
+                lx = None
+        # One visible side permits brief estimation even if opposite side has never been observed.
+        if rx is None and raw_left:
+            rx = lx + lane_width
+        if lx is None and raw_right:
+            lx = rx - lane_width
+        # No raw observations after hold => no steering from stale coordinates.
+        lane_lost = not (valid_r or valid_l)
+        lane_type = ('both' if raw_right and raw_left else 'right' if raw_right else
+                     'left' if raw_left else 'none')
+        if rx is None or lx is None:
+            line_center_x = float(frame_center)
+        else:
+            line_center_x = (rx + lx) / 2.0
+        info = {'line_center_x': line_center_x, 'target_x': frame_center,
+                'error': line_center_x-frame_center, 'error_max': frame_center,
+                'lane_type': lane_type, 'center_right_x': rx, 'center_left_x': lx,
+                'lane_uncertain': not (raw_right and raw_left), 'lane_lost': lane_lost,
+                'lane_width_px': lane_width}
         lanes_frame = None
         if DEBUG_SHOW or USE_DASHBOARD:
-            lanes_frame = self._draw_debug(
-                frame, (left_rl, top_rl, right_rl, bottom_rl), (left_ll, top_ll, right_ll, bottom_ll),
-                center_right_x, center_left_x, right_detected_raw, left_detected_raw,
-                len(right_lines_info), len(left_lines_info), longest_line_length, lane_type)
-
-        line_info = {
-            'line_center_x': line_center_x,
-            'target_x': target_x,
-            'error': error,
-            'error_max': error_max,
-            'lane_type': lane_type,
-            'center_right_x': center_right_x,
-            'center_left_x': center_left_x,
-            'lane_uncertain': lane_uncertain,
-            'lane_lost': lane_lost,
-        }
-        return lanes_frame, line_info
+            lanes_frame = self._draw_debug(frame, (rb[2], rb[0], rb[3], rb[1]),
+                       (lb[2], lb[0], lb[3], lb[1]), rx, lx, raw_right, raw_left,
+                       len(right['kept']), len(left['kept']),
+                       max(right['longest'], left['longest']), lane_type)
+        return lanes_frame, info
 
     @staticmethod
     def _draw_debug(frame, rl_box, ll_box, center_right_x, center_left_x,
@@ -462,10 +373,12 @@ class VisionProcessor:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
         # Thick line = freshly detected, thin line = held/estimated
-        cv2.line(lanes_frame, (int(center_right_x), top_rl), (int(center_right_x), bottom_rl),
-                 (255, 0, 0), 2 if right_detected else 1)
-        cv2.line(lanes_frame, (int(center_left_x), top_ll), (int(center_left_x), bottom_ll),
-                 (0, 0, 255), 2 if left_detected else 1)
+        if center_right_x is not None:
+            cv2.line(lanes_frame, (int(center_right_x), top_rl), (int(center_right_x), bottom_rl),
+                     (255, 0, 0), 2 if right_detected else 1)
+        if center_left_x is not None:
+            cv2.line(lanes_frame, (int(center_left_x), top_ll), (int(center_left_x), bottom_ll),
+                     (0, 0, 255), 2 if left_detected else 1)
 
         cv2.putText(lanes_frame, f"R Lines: {n_right}", (left_rl + 5, top_rl + 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
@@ -491,6 +404,19 @@ class LaneTrackingVehicle:
             'HOUGH_THRESHOLD': HOUGH_THRESHOLD,
             'MIN_LINE_LENGTH': MIN_LINE_LENGTH,
             'MAX_LINE_GAP': MAX_LINE_GAP,
+            'LANE_HOLD_TIME_SEC': LANE_HOLD_TIME_SEC,
+            'LANE_WIDTH_EMA_ALPHA': LANE_WIDTH_EMA_ALPHA,
+            'LANE_WIDTH_INIT_PX': LANE_WIDTH_INIT_PX,
+            'LANE_WIDTH_MIN_PX': LANE_WIDTH_MIN_PX,
+            'LANE_WIDTH_MAX_PX': LANE_WIDTH_MAX_PX,
+            'LANE_WIDTH_MAX_CHANGE_PX': LANE_WIDTH_MAX_CHANGE_PX,
+            'LANE_WIDTH_MAX_STEP_PX': LANE_WIDTH_MAX_STEP_PX,
+            'LINE_MIN_ANGLE_DEG': LINE_MIN_ANGLE_DEG,
+            'LINE_MAX_ANGLE_DEG': LINE_MAX_ANGLE_DEG,
+            'LINE_BOTTOM_TOLERANCE_PX': LINE_BOTTOM_TOLERANCE_PX,
+            'LINE_ANGLE_TOLERANCE_DEG': LINE_ANGLE_TOLERANCE_DEG,
+            'LINE_EXTRAPOLATION_MARGIN_PX': LINE_EXTRAPOLATION_MARGIN_PX,
+
             'RIGHT_MIN_ABS_SLOPE': RIGHT_MIN_ABS_SLOPE,
             'LEFT_MIN_ABS_SLOPE': LEFT_MIN_ABS_SLOPE,
             'ROI_TOP_RL': ROI_TOP_RL,
@@ -506,7 +432,9 @@ class LaneTrackingVehicle:
         self.vision = VisionProcessor(self.config)
         self.steering = Steering()
         self.robot = RobotController()
-        self.running = AUTO_START
+        self.running = AUTO_START and serial_error is None
+        self.fault = serial_error
+        self.stopped_for_lane = False
         self.lane_missing_since = None
         self.last_heartbeat = 0.0
         
@@ -520,13 +448,22 @@ class LaneTrackingVehicle:
         cmd = dashboard.state.pop_command()
         if cmd == "stop":
             self.running = False
-            send_command(b'STOP\r\n')
-        elif cmd == "start":
+            if self.fault is None:
+                self.robot.stop()
+        elif cmd == "start" and self.fault is None:
+            send_command(b'ARM\r\n', force=True)
+            self.robot.angle_old = None
+            self.robot.speed_old = None
+            _serial_cache.pop(b'F', None)
             self.running = True
 
     def run(self) -> None:
         print("Robot started. Press Ctrl+C to stop.")
         try:
+            if self.running:
+                send_command(b'ARM\r\n', force=True)
+                send_command(b'HB\r\n', force=True)
+                self.last_heartbeat = time.monotonic()
             last_log, frames, fps = time.time(), 0, 0
             while True:
                 t0 = time.time()
@@ -550,7 +487,7 @@ class LaneTrackingVehicle:
                 )
                 now = time.monotonic()
                 
-                if self.running and now - self.last_heartbeat >= HEARTBEAT_INTERVAL:
+                if self.running and self.fault is None and now - self.last_heartbeat >= HEARTBEAT_INTERVAL:
                     if send_command(b'HB\r\n'):
                         self.last_heartbeat = now
 
@@ -568,15 +505,18 @@ class LaneTrackingVehicle:
 
                 if lost_duration >= LANE_LOST_STOP_SECONDS:
                     speed = 0
-
                     if self.running:
                         self.robot.stop()
+                        self.stopped_for_lane = True
+                        self.running = False  # require explicit dashboard START to resume
 
                 else:
                     speed = self.steering.compute_speed(angle, lane_type)
-
+                    if line_info['lane_uncertain']:
+                        speed = min(speed, UNCERTAIN_SPEED_CAP)
                     if self.running:
                         self.robot.drive(angle, speed)
+                        self.stopped_for_lane = False
 
                 frames += 1
                 if time.time() - last_log >= 1:
@@ -589,6 +529,8 @@ class LaneTrackingVehicle:
                     dashboard.state.frames["lanes"] = lanes_frame
                     dashboard.state.telemetry = {
                         "running": self.running,
+                        "fault": self.fault,
+                        "lane_width_px": round(line_info["lane_width_px"], 1),
                         "fps": fps,
                         "lane": line_info['lane_type'],
                         "error_px": round(line_info['error'], 1),
@@ -602,16 +544,23 @@ class LaneTrackingVehicle:
                         break
         except KeyboardInterrupt:
             print("Stopped by user")
+        except (SerialControlError, OSError, cv2.error) as exc:
+            self.fault = str(exc)
+            self.running = False
+            print('[FAULT] Robot halted:', self.fault)
+            if USE_DASHBOARD:
+                dashboard.state.publish_telemetry({'running': False, 'fault': self.fault})
         finally:
             self._cleanup()
 
     def _cleanup(self) -> None:
-        self.camera.release()
         self.robot.close()
+        self.camera.release()
         if DEBUG_SHOW:
             cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
+    init_serial()
     vehicle = LaneTrackingVehicle()
     vehicle.run()
