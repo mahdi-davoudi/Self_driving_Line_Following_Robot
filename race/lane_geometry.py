@@ -16,7 +16,7 @@ def detect_side(gray, bounds, side, p):
     h, w = gray.shape[:2]
     top, bottom = max(0, top), min(h, bottom)
     left, right = max(0, left), min(w, right)
-    out = {'center_x': None, 'kept': [], 'rejected': [], 'edges': np.zeros((8, 8), np.uint8), 'longest': 0}
+    out = {'center_x': None, 'slope_dx_dy': None, 'kept': [], 'rejected': [], 'edges': np.zeros((8, 8), np.uint8), 'longest': 0}
     if bottom - top < 4 or right - left < 4:
         return out
     roi = gray[top:bottom, left:right]
@@ -50,7 +50,7 @@ def detect_side(gray, bounds, side, p):
         if (side == 'right' and x_bottom < w / 2) or (side == 'left' and x_bottom > w / 2):
             out['rejected'].append(segment)
             continue
-        candidates.append((segment, x_bottom, angle, length, 1 if dx * dy > 0 else -1))
+        candidates.append((segment, x_bottom, angle, length, 1 if dx * dy > 0 else -1, dx / dy))
     if not candidates:
         return out
     # Dominant inclination sign avoids mixing two competing line families.
@@ -70,4 +70,5 @@ def detect_side(gray, bounds, side, p):
     if kept:
         out['center_x'] = float(sum(v[1] * v[3] for v in kept) / sum(v[3] for v in kept))
         out['longest'] = int(max(v[3] for v in kept))
+        out['slope_dx_dy'] = weighted_median([v[5] for v in kept], [v[3] for v in kept])
     return out

@@ -13,17 +13,11 @@ from typing import Tuple, Dict, Optional
 STEER_CENTER = 90
 STEER_MIN = 50
 STEER_MAX = 125
-FALLBACK_ANGLE = STEER_CENTER + 25   # steering angle used when both lines are lost
+FALLBACK_ANGLE = STEER_CENTER - 25   # fallback direction after steering polarity is reversed
 
 # Speed (PWM) limits (the Arduino MAX_SPEED must be >= MAX_SPEED here)
-MAX_SPEED = 210              # speed on a straight path
-MIN_SPEED = 180              # absolute lower limit
-TURN_SPEED_DROP = 15         # speed lost at the sharpest turn (use 10..15)
-UNCERTAIN_SPEED_CAP = 185    # max speed while a lane is being held/estimated
+MAX_SPEED = 140              # speed on a straight path
 ARDUINO_MAX_PWM = 210
-
-ONE_LINE_SPEED = 180
-BOTH_LINES_LOST_SPEED = 160
 LANE_LOST_STOP_SECONDS = 3
 
 # Steering gain parameters
@@ -31,7 +25,7 @@ K_MIN = 0.3
 K_MAX = 1.5
 
 # Lane detection parameters
-CANNY_LOW = 60
+CANNY_LOW = 80
 CANNY_HIGH = 160
 HOUGH_THRESHOLD = 50
 MIN_LINE_LENGTH = 30
@@ -41,12 +35,16 @@ MAX_LINE_GAP = 60
 # When a lane is not detected in the current frame, hold the last known position
 # (or estimate it from the other lane) for a short window, and only fall back
 # to a fixed steering angle once that window is exceeded.
-LANE_HOLD_TIME_SEC = 0.4    # monotonic seconds, independent of FPS
+LANE_HOLD_TIME_SEC = 0.4    # right solid-line short hold
+LEFT_DASH_HOLD_INDEFINITE = True  # retain last dashed-line center/slope until next dash is detected
+LANE_RECOVERY_STEP_DEG = 10.0     # steer increment toward the right when BOTH raw lines are missing
+LANE_RECOVERY_INTERVAL_SEC = 0.5  # seconds between recovery increments
 LANE_WIDTH_EMA_ALPHA = 0.05  # how fast the estimated lane width (px) adapts
-LANE_WIDTH_INIT_PX = 140     # tune to track at 384x216
-LANE_WIDTH_MIN_PX = 95
-LANE_WIDTH_MAX_PX = 220
-LANE_WIDTH_MAX_CHANGE_PX = 25  # reject abrupt measured jumps
+LANE_WIDTH_INIT_PX = 293     # measured calibration median: about 293 px at 384x216
+LANE_CENTER_OFFSET_PX = 0.0   # positive shifts target right in the image; tune from dashboard
+LANE_WIDTH_MIN_PX = 250
+LANE_WIDTH_MAX_PX = 340
+LANE_WIDTH_MAX_CHANGE_PX = 80  # allow initial adoption of measured width
 LANE_WIDTH_MAX_STEP_PX = 2.0   # per accepted update, after EMA
 LANE_WIDTH_MEDIAN_WINDOW = 7
 LINE_MIN_ANGLE_DEG = 24.0
@@ -63,7 +61,7 @@ F_Height = 216
 ROI_TOP_RL = 0.65
 ROI_BOTTOM_RL = 1.0
 ROI_LEFT_RL = 0.65
-ROI_RIGHT_RL = 0.9
+ROI_RIGHT_RL = 0.95
 
 # ROI for left lane detection (by percentage)
 ROI_TOP_LL = 0.65
@@ -138,7 +136,7 @@ def init_serial():
         print('Using serial port:', port)
         time.sleep(2)  # reset after opening serial
         send_command(b'STOP\r\n')
-        send_command(f'SPD{MIN_SPEED}\r\n'.encode())
+        send_command(f'SPD{MAX_SPEED}\r\n'.encode())
         send_command(f'S{STEER_CENTER}\r\n'.encode())
     except (serial.SerialException, OSError, SerialControlError) as exc:
         serial_error = f'Serial initialization failed: {exc}'
@@ -172,13 +170,13 @@ class CameraConfig:
                 "AeEnable": False,
                 "AwbEnable": False,
                 "AnalogueGain": 1.0,
-                "ExposureTime": 35000,
-                "Brightness": 0.4,
+                "ExposureTime": 30000,
+                "Brightness": 0.0,
                 "Contrast": 1.0,
                 "Saturation": 1.0,
                 "Sharpness": 0.0,
                 "NoiseReductionMode": 0,
-                "FrameDurationLimits": (50000, 50000),
+                "FrameDurationLimits": (40000, 40000),
             })
             self.picam2.start()
             time.sleep(1)
@@ -212,34 +210,17 @@ class Steering:
         self.max_deviation = max(STEER_MAX - STEER_CENTER, STEER_CENTER - STEER_MIN)
 
     def compute_angle(self, error: float, error_max: float, lane_lost: bool) -> float:
-        if lane_lost:
-            return float(FALLBACK_ANGLE)
-
         # Adaptive gain based on error magnitude
         error_norm = min(abs(error) / error_max, 1.0)
         gain = K_MIN + (K_MAX - K_MIN) * error_norm
+        # Positive error means the detected lane center is right of image center.
+        # Based on the observed servo/robot response, reduce the servo angle to steer left.
         angle = STEER_CENTER + gain * error
         return max(STEER_MIN, min(STEER_MAX, angle))
 
     def compute_speed(self, angle: float, lane_type: str) -> int:
-        """Calculate motor PWM according to lane detection confidence."""
-
-        if lane_type == "none":
-            return BOTH_LINES_LOST_SPEED
-
-        turn_ratio = min(
-            abs(angle - STEER_CENTER) / self.max_deviation,
-            1.0
-        )
-
-        speed = MAX_SPEED - TURN_SPEED_DROP * turn_ratio
-
-        if lane_type in ("left", "right"):
-            speed = min(speed, ONE_LINE_SPEED)
-        else:
-            speed = max(MIN_SPEED, speed)
-
-        return int(round(max(0, min(MAX_SPEED, speed))))
+        """Return constant motor PWM; steering angle does not affect speed."""
+        return MAX_SPEED
 
 
 # ROBOT (serial output only)
@@ -279,6 +260,7 @@ class VisionProcessor:
     def __init__(self, config: dict):
         self.config = config
         self.last_center_left_x = None
+        self.last_left_slope_dx_dy = None
         self.last_center_right_x = None
         self.last_seen_left = None
         self.last_seen_right = None
@@ -315,6 +297,7 @@ class VisionProcessor:
             self.last_seen_right, self.last_center_right_x = now, rx
         if raw_left:
             self.last_seen_left, self.last_center_left_x = now, lx
+            self.last_left_slope_dx_dy = left.get('slope_dx_dy')
         hold = float(p['LANE_HOLD_TIME_SEC'])
         valid_r = raw_right or (self.last_seen_right is not None and now - self.last_seen_right <= hold)
         valid_l = raw_left or (self.last_seen_left is not None and now - self.last_seen_left <= hold)
@@ -326,10 +309,15 @@ class VisionProcessor:
             else:
                 rx = None
         if not raw_left:
-            if valid_l and raw_right:
-                lx = rx - lane_width
-            elif valid_l:
+            if LEFT_DASH_HOLD_INDEFINITE and self.last_center_left_x is not None:
+                # Dashed LEFT boundary: keep the last detected dash position/slope
+                # until a new dash is detected; do not replace it with rx-lane_width.
                 lx = self.last_center_left_x
+            elif valid_l and self.last_center_left_x is not None:
+                lx = self.last_center_left_x
+            elif raw_right:
+                # Before the first dash has ever been seen, estimate from solid RIGHT.
+                lx = rx - lane_width
             else:
                 lx = None
         # One visible side permits brief estimation even if opposite side has never been observed.
@@ -337,30 +325,57 @@ class VisionProcessor:
             rx = lx + lane_width
         if lx is None and raw_right:
             lx = rx - lane_width
-        # No raw observations after hold => no steering from stale coordinates.
-        lane_lost = not (valid_r or valid_l)
+        # The solid RIGHT boundary is the primary tracking reference.
+        # The dashed LEFT boundary is used only to update the lane-width estimate.
+        # If LEFT disappears, infer its position from RIGHT and the last stable width.
+        # If RIGHT disappears briefly, retain its last valid position; if only LEFT
+        # remains, estimate RIGHT from LEFT + the stable width.
+        lane_lost = not (raw_right or raw_left)
         lane_type = ('both' if raw_right and raw_left else 'right' if raw_right else
                      'left' if raw_left else 'none')
-        if rx is None or lx is None:
-            line_center_x = float(frame_center)
+
+        if rx is not None and self.last_center_left_x is not None:
+            # RIGHT is the live primary boundary; LEFT uses the last detected dash
+            # (center + slope model) until the next dashed segment is detected.
+            base_center_x = (float(rx) + float(lx)) / 2.0
+        elif rx is not None:
+            # Before the first left dash is seen, use the calibrated lane width.
+            base_center_x = float(rx) - (lane_width / 2.0)
+        elif lx is not None:
+            # If RIGHT is temporarily missing, estimate it from the retained LEFT dash.
+            estimated_right_x = float(lx) + lane_width
+            base_center_x = (estimated_right_x + float(lx)) / 2.0
+            rx = estimated_right_x
         else:
-            line_center_x = (rx + lx) / 2.0
+            base_center_x = float(frame_center)
+
+        offset = float(p.get('LANE_CENTER_OFFSET_PX', LANE_CENTER_OFFSET_PX))
+        line_center_x = base_center_x + offset
+        lane_status = {
+            'both': 'BOTH LINES DETECTED',
+            'right': 'RIGHT ONLY - CENTER ESTIMATED',
+            'left': 'LEFT ONLY - RIGHT ESTIMATED',
+            'none': 'NO LINE DETECTED'
+        }[lane_type]
         info = {'line_center_x': line_center_x, 'target_x': frame_center,
                 'error': line_center_x-frame_center, 'error_max': frame_center,
-                'lane_type': lane_type, 'center_right_x': rx, 'center_left_x': lx,
+                'lane_type': lane_type, 'lane_status': lane_status,
+                'center_right_x': rx, 'center_left_x': lx,
                 'lane_uncertain': not (raw_right and raw_left), 'lane_lost': lane_lost,
-                'lane_width_px': lane_width}
+                'lane_width_px': lane_width, 'lane_center_offset_px': offset}
         lanes_frame = None
         if DEBUG_SHOW or USE_DASHBOARD:
             lanes_frame = self._draw_debug(frame, (rb[2], rb[0], rb[3], rb[1]),
                        (lb[2], lb[0], lb[3], lb[1]), rx, lx, raw_right, raw_left,
                        len(right['kept']), len(left['kept']),
-                       max(right['longest'], left['longest']), lane_type)
+                       max(right['longest'], left['longest']), lane_type,
+                       self.last_left_slope_dx_dy)
         return lanes_frame, info
 
     @staticmethod
     def _draw_debug(frame, rl_box, ll_box, center_right_x, center_left_x,
-                    right_detected, left_detected, n_right, n_left, longest, lane_type):
+                    right_detected, left_detected, n_right, n_left, longest, lane_type,
+                    left_slope_dx_dy=None):
         left_rl, top_rl, right_rl, bottom_rl = rl_box
         left_ll, top_ll, right_ll, bottom_ll = ll_box
 
@@ -377,7 +392,10 @@ class VisionProcessor:
             cv2.line(lanes_frame, (int(center_right_x), top_rl), (int(center_right_x), bottom_rl),
                      (255, 0, 0), 2 if right_detected else 1)
         if center_left_x is not None:
-            cv2.line(lanes_frame, (int(center_left_x), top_ll), (int(center_left_x), bottom_ll),
+            slope = float(left_slope_dx_dy or 0.0)
+            x_bottom = int(round(center_left_x))
+            x_top = int(round(center_left_x - (bottom_ll - top_ll) * slope))
+            cv2.line(lanes_frame, (x_top, top_ll), (x_bottom, bottom_ll),
                      (0, 0, 255), 2 if left_detected else 1)
 
         cv2.putText(lanes_frame, f"R Lines: {n_right}", (left_rl + 5, top_rl + 15),
@@ -386,7 +404,9 @@ class VisionProcessor:
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         cv2.putText(lanes_frame, f"Len: {longest} px", (left_rl + 5, top_rl + 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        cv2.putText(lanes_frame, f"Lane: {lane_type}", (10, 70),
+        display_lane = {'both': 'BOTH', 'right': 'RIGHT ONLY - ESTIMATED CENTER',
+                        'left': 'LEFT ONLY - ESTIMATED RIGHT', 'none': 'NO LINE'}[lane_type]
+        cv2.putText(lanes_frame, f"Tracking: {display_lane}", (10, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         return lanes_frame
 
@@ -407,6 +427,7 @@ class LaneTrackingVehicle:
             'LANE_HOLD_TIME_SEC': LANE_HOLD_TIME_SEC,
             'LANE_WIDTH_EMA_ALPHA': LANE_WIDTH_EMA_ALPHA,
             'LANE_WIDTH_INIT_PX': LANE_WIDTH_INIT_PX,
+            'LANE_CENTER_OFFSET_PX': LANE_CENTER_OFFSET_PX,
             'LANE_WIDTH_MIN_PX': LANE_WIDTH_MIN_PX,
             'LANE_WIDTH_MAX_PX': LANE_WIDTH_MAX_PX,
             'LANE_WIDTH_MAX_CHANGE_PX': LANE_WIDTH_MAX_CHANGE_PX,
@@ -437,6 +458,9 @@ class LaneTrackingVehicle:
         self.stopped_for_lane = False
         self.lane_missing_since = None
         self.last_heartbeat = 0.0
+        self.lane_recovery_angle = float(STEER_CENTER)
+        self.last_recovery_step = 0.0
+        self.last_drive_angle = float(STEER_CENTER)
         
         if USE_DASHBOARD:
             dashboard.state.config = self.config
@@ -486,22 +510,35 @@ class LaneTrackingVehicle:
                     line_info['lane_lost']
                 )
                 now = time.monotonic()
+                lane_type = line_info['lane_type']
+
+                if lane_type == "none":
+                    if self.lane_missing_since is None:
+                        self.lane_missing_since = now
+                        self.lane_recovery_angle = self.last_drive_angle
+                        self.last_recovery_step = now
+                    elif now - self.last_recovery_step >= LANE_RECOVERY_INTERVAL_SEC:
+                        # Increasing servo angle steers RIGHT on this robot.
+                        self.lane_recovery_angle = min(
+                            STEER_MAX,
+                            self.lane_recovery_angle + LANE_RECOVERY_STEP_DEG
+                        )
+                        self.last_recovery_step = now
+                    angle = self.lane_recovery_angle
+                else:
+                    self.lane_missing_since = None
+                    self.lane_recovery_angle = angle
+                    self.last_drive_angle = angle
                 
                 if self.running and self.fault is None and now - self.last_heartbeat >= HEARTBEAT_INTERVAL:
                     if send_command(b'HB\r\n'):
                         self.last_heartbeat = now
 
                 now = time.monotonic()
-                lane_type = line_info['lane_type']
-
-                if lane_type == "none":
-                    if self.lane_missing_since is None:
-                        self.lane_missing_since = now
-
-                    lost_duration = now - self.lane_missing_since
-                else:
-                    self.lane_missing_since = None
-                    lost_duration = 0.0
+                lost_duration = (
+                    now - self.lane_missing_since
+                    if self.lane_missing_since is not None else 0.0
+                )
 
                 if lost_duration >= LANE_LOST_STOP_SECONDS:
                     speed = 0
@@ -511,9 +548,8 @@ class LaneTrackingVehicle:
                         self.running = False  # require explicit dashboard START to resume
 
                 else:
-                    speed = self.steering.compute_speed(angle, lane_type)
-                    if line_info['lane_uncertain']:
-                        speed = min(speed, UNCERTAIN_SPEED_CAP)
+                    # Fixed full speed: no turn-based or uncertainty-based speed reduction.
+                    speed = MAX_SPEED
                     if self.running:
                         self.robot.drive(angle, speed)
                         self.stopped_for_lane = False
@@ -533,6 +569,11 @@ class LaneTrackingVehicle:
                         "lane_width_px": round(line_info["lane_width_px"], 1),
                         "fps": fps,
                         "lane": line_info['lane_type'],
+                        "lane_status": line_info['lane_status'],
+                        "left_dash_held": bool(self.vision.last_center_left_x is not None and line_info['lane_type'] == 'right'),
+                        "recovery_angle": int(round(self.lane_recovery_angle)),
+                        "lane_status": line_info['lane_status'],
+                        "lane_center_offset_px": round(line_info["lane_center_offset_px"], 1),
                         "error_px": round(line_info['error'], 1),
                         "angle": int(round(angle)),
                         "speed": speed,
